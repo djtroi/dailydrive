@@ -148,22 +148,56 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
 
     try {
       if (mode === "oldest_unplayed") {
-        // Scan a larger window to find unplayed episodes
+        // Scan through episodes in batches of 50 (Spotify API max per request)
         const scanLimit = podcast.scan_limit || 50;
-        const data = await spotifyApi.getShowEpisodes(podcast.id, {
-          limit: scanLimit,
-          market: "US",
-        });
+        const batchSize = 50;
+        let offset = 0;
+        let scanned = 0;
+        const unplayed = [];
 
-        // Filter out fully played episodes, then reverse so oldest comes first
-        const unplayed = data.body.items
-          .filter((ep) => !ep.resume_point?.fully_played)
-          .reverse();
+        while (scanned < scanLimit) {
+          const limit = Math.min(batchSize, scanLimit - scanned);
+          const data = await spotifyApi.getShowEpisodes(podcast.id, {
+            limit,
+            offset,
+            market: "US",
+          });
+
+          const items = data.body.items;
+          if (items.length === 0) break; // No more episodes
+
+          for (const ep of items) {
+            const status = ep.resume_point?.fully_played ? "✅ played" : "⬜ unplayed";
+            console.log(`    ${status}  ${ep.name}`);
+
+            if (!ep.resume_point?.fully_played) {
+              unplayed.push(ep);
+            }
+          }
+
+          scanned += items.length;
+          offset += items.length;
+
+          // If we got fewer than requested, we've reached the end
+          if (items.length < limit) break;
+
+          console.log(`    📊 Scanned ${scanned}/${scanLimit} episodes, ${unplayed.length} unplayed so far...`);
+        }
+
+        console.log(`    📊 Scan complete: ${scanned} episodes scanned, ${unplayed.length} unplayed found`);
+
+        // Reverse so oldest unplayed comes first
+        unplayed.reverse();
 
         let selected;
         if (unplayed.length === 0) {
           console.log(`    ℹ️  No unplayed episodes found — falling back to newest`);
-          selected = data.body.items.slice(0, count);
+          // Fallback: grab newest (re-fetch first batch)
+          const fallback = await spotifyApi.getShowEpisodes(podcast.id, {
+            limit: count,
+            market: "US",
+          });
+          selected = fallback.body.items;
         } else {
           selected = unplayed.slice(0, count);
         }
@@ -176,7 +210,7 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
             type: "episode",
             position: podcast.position || null,
           });
-          console.log(`    📌 ${episode.name}`);
+          console.log(`    📌 Selected: ${episode.name}`);
         }
       } else {
         // Default "newest" mode — original behavior
