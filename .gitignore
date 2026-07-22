@@ -10,6 +10,7 @@
 .spotify-token.json
 spotify-token.json
 *token*.json
+heard-tracks.json
 
 # User config — contains client_id, client_secret, playlist IDs
 config.yaml

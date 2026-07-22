@@ -2,28 +2,6 @@
 // =============================================================================
 // Daily Drive — Main Script (Feb 2026 API compatible)
 // =============================================================================
-// Builds your custom Daily Drive playlist by mixing podcasts and music.
-//
-// Fork changes:
-//   1. Podcasts: skip fully-played episodes entirely (no fallback)
-//   2. Music discovery: Artist-Pool-Mining
-//      - Seeds from GET /me/tracks (saved library)
-//      - Expands via appears_on albums (co-artists) + featured artists
-//      - Persistent artist pool (artist-pool.json), max 500, FIFO eviction
-//      - Tracks >65s, not in library, not recently played
-//
-// Feb 2026 API endpoints used:
-//   ✅ GET /me/tracks               (saved tracks → seed artists)
-//   ✅ GET /me/top/{type}            (top tracks for familiar pool)
-//   ✅ GET /artists/{id}/albums      (album mining + appears_on co-artists)
-//   ✅ GET /albums/{id}/tracks       (discover tracks from albums)
-//   ✅ GET /me/library/contains      (replaces /me/tracks/contains)
-//   ✅ GET /me/player/recently-played
-//   ✅ GET /playlists/{id}/items     (replaces /tracks)
-//   ✅ GET /shows/{id}/episodes
-//   ✅ PUT /playlists/{id}/items
-//   ✅ POST /playlists/{id}/items
-// =============================================================================
 
 const fs = require("fs");
 const yaml = require("js-yaml");
@@ -34,6 +12,8 @@ const CONFIG_FILE = "config.yaml";
 const STATE_FILE = "state.json";
 const ARTIST_POOL_FILE = "artist-pool.json";
 const ARTIST_POOL_MAX = 500;
+const HEARD_TRACKS_FILE = "heard-tracks.json";
+const HEARD_TRACKS_MAX = 3000;
 
 const DRY_RUN = process.argv.includes("--dry-run");
 const PODCAST_ONLY = process.argv.includes("--podcast-only");
@@ -102,8 +82,18 @@ async function spotifyFetch(spotifyApi, url) {
   return res.json();
 }
 
-/** Small delay to be friendly with Spotify rate limits */
 function delay(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function loadHeardTracks() {
+  if (!fs.existsSync(HEARD_TRACKS_FILE)) return [];
+  try { return JSON.parse(fs.readFileSync(HEARD_TRACKS_FILE, "utf8")); }
+  catch { return []; }
+}
+
+function saveHeardTracks(heard) {
+  while (heard.length > HEARD_TRACKS_MAX) heard.shift();
+  fs.writeFileSync(HEARD_TRACKS_FILE, JSON.stringify(heard, null, 2));
+}
 
 // =============================================================================
 // Artist Pool — persistent, FIFO, max 500
@@ -122,12 +112,7 @@ function saveArtistPool(pool) {
   fs.writeFileSync(ARTIST_POOL_FILE, JSON.stringify(pool, null, 2));
 }
 
-/**
- * Adds an artist to the pool. FIFO: if pool > max, remove oldest.
- * Returns true if the artist was newly added.
- */
 function addToPool(pool, artistId, artistName) {
-  // Already in pool? Move to end (refresh)
   const existingIdx = pool.artists.findIndex((a) => a.id === artistId);
   if (existingIdx !== -1) {
     const existing = pool.artists.splice(existingIdx, 1)[0];
@@ -136,14 +121,12 @@ function addToPool(pool, artistId, artistName) {
     return false;
   }
 
-  // Add new
   pool.artists.push({
     id: artistId,
     name: artistName,
     added: new Date().toISOString(),
   });
 
-  // FIFO eviction
   while (pool.artists.length > ARTIST_POOL_MAX) {
     const removed = pool.artists.shift();
     console.log(`    🗑️  Pool full — evicted oldest: ${removed.name}`);
@@ -210,7 +193,6 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
           console.log(`    📌 Selected: ${episode.name}`);
         }
       } else {
-        // "newest" mode — skip fully_played
         const data = await spotifyApi.getShowEpisodes(podcast.id, {
           limit: count + 5, market: "US",
         });
@@ -249,7 +231,6 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
 async function fetchMusicPool(spotifyApi, musicConfig) {
   let allTracks = [];
 
-  // Source 1: playlists
   if (musicConfig.playlists) {
     for (const playlist of musicConfig.playlists) {
       if (!playlist.id || playlist.id === "your-playlist-id") continue;
@@ -283,7 +264,6 @@ async function fetchMusicPool(spotifyApi, musicConfig) {
     }
   }
 
-  // Source 2: top tracks
   if (musicConfig.top_tracks?.enabled) {
     const timeRange = musicConfig.top_tracks.time_range || "short_term";
     const count = musicConfig.top_tracks.count || 30;
@@ -312,7 +292,6 @@ async function fetchMusicPool(spotifyApi, musicConfig) {
     }
   }
 
-  // Deduplicate
   const seen = new Set();
   allTracks = allTracks.filter((t) => {
     if (seen.has(t.uri)) return false;
@@ -328,10 +307,6 @@ async function fetchMusicPool(spotifyApi, musicConfig) {
 // Artist Pool Growth — Saved Tracks + appears_on + featured artists
 // =============================================================================
 
-/**
- * Step 1: Seed artist pool from user's saved tracks (GET /me/tracks).
- * Fetches the most recent 200 saved tracks and extracts artist IDs.
- */
 async function seedPoolFromSavedTracks(spotifyApi, pool) {
   console.log(`🌱 Seeding artist pool from saved tracks...`);
   let added = 0;
@@ -347,7 +322,6 @@ async function seedPoolFromSavedTracks(spotifyApi, pool) {
       for (const entry of data.body.items) {
         const track = entry.track;
         if (!track) continue;
-
         for (const artist of track.artists || []) {
           if (artist.id && addToPool(pool, artist.id, artist.name)) {
             added++;
@@ -365,13 +339,6 @@ async function seedPoolFromSavedTracks(spotifyApi, pool) {
   console.log(`    🌱 Added ${added} new artists from saved tracks (pool: ${pool.artists.length})`);
 }
 
-/**
- * Step 2: Expand pool by mining appears_on albums + featured artists.
- * For N random pool artists:
- *   - GET /artists/{id}/albums?include_groups=appears_on,album,single
- *   - From appears_on albums: the album owner is a co-artist → add to pool
- *   - From album tracks: featured artists → add to pool
- */
 async function expandPool(spotifyApi, pool, artistsToMine) {
   console.log(`⛏️  Expanding pool — mining ${artistsToMine} random artists for co-artists...`);
 
@@ -380,7 +347,6 @@ async function expandPool(spotifyApi, pool, artistsToMine) {
 
   for (const entry of candidates) {
     try {
-      // Fetch albums including appears_on
       const albumData = await spotifyApi.getArtistAlbums(entry.id, {
         limit: 20,
         include_groups: "appears_on,album,single",
@@ -389,7 +355,6 @@ async function expandPool(spotifyApi, pool, artistsToMine) {
       const albums = albumData.body.items;
 
       for (const album of albums) {
-        // Co-artist: the album's own artists (for appears_on, this is the OTHER artist)
         for (const albumArtist of album.artists || []) {
           if (albumArtist.id && albumArtist.id !== entry.id) {
             if (addToPool(pool, albumArtist.id, albumArtist.name)) {
@@ -399,7 +364,6 @@ async function expandPool(spotifyApi, pool, artistsToMine) {
         }
       }
 
-      // Pick 1 random album to deep-mine featured artists from tracks
       if (albums.length > 0) {
         const randomAlbum = albums[Math.floor(Math.random() * albums.length)];
         try {
@@ -413,12 +377,10 @@ async function expandPool(spotifyApi, pool, artistsToMine) {
               }
             }
           }
-        } catch (err) {
-          // Album track fetch failed — non-critical
-        }
+        } catch (err) { /* non-critical */ }
       }
 
-      await delay(50); // Be gentle with rate limits
+      await delay(50);
     } catch (err) {
       console.error(`    ⚠️  Mining failed for ${entry.name}: ${err.message}`);
     }
@@ -431,17 +393,13 @@ async function expandPool(spotifyApi, pool, artistsToMine) {
 // Discovery — fetch tracks from pool artists, filter aggressively
 // =============================================================================
 
-/**
- * Picks random artists from the pool, fetches random albums,
- * collects tracks >65s, excludes known tracks + library + recently played.
- */
 async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
   console.log(`🔍 Discovering ${count} tracks from artist pool (${artistPool.artists.length} artists)...`);
 
   const poolUris = new Set(poolTracks.map((t) => t.uri));
   const candidates = [];
 
-  // Recently played exclusion
+  // ── Exclusion set 1: recently played ──
   const recentUris = new Set();
   try {
     const recent = await spotifyApi.getMyRecentlyPlayedTracks({ limit: 50 });
@@ -451,13 +409,18 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
     console.error(`    ⚠️  Could not fetch recently played: ${err.message}`);
   }
 
-  // Mine random pool artists
+  // ── Exclusion set 2: previously heard discovery tracks ──
+  const heardTracks = loadHeardTracks();
+  const heardUris = new Set(heardTracks.map((h) => h.uri));
+  console.log(`    🔇 Excluding ${heardUris.size} previously heard discovery tracks`);
+
+  // ── Mine random pool artists ──
   const shuffledArtists = shuffle(artistPool.artists);
   const maxToMine = Math.min(shuffledArtists.length, 20);
   const minedAlbums = new Set();
 
   for (let i = 0; i < maxToMine; i++) {
-    if (candidates.length >= count * 4) break; // enough candidates
+    if (candidates.length >= count * 4) break;
 
     const artist = shuffledArtists[i];
 
@@ -470,7 +433,6 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
       const albums = albumData.body.items.filter((a) => !minedAlbums.has(a.id));
       if (albums.length === 0) continue;
 
-      // Pick 1-2 random albums
       const picks = shuffle(albums).slice(0, 2);
 
       for (const album of picks) {
@@ -479,10 +441,11 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
         const trackData = await spotifyApi.getAlbumTracks(album.id, { limit: 50 });
 
         for (const track of trackData.body.items) {
-          if (track.duration_ms < 65000) continue;       // too short (skit/intro)
-          if (poolUris.has(track.uri)) continue;          // already in familiar pool
-          if (recentUris.has(track.uri)) continue;        // recently played
-          if (candidates.some((c) => c.uri === track.uri)) continue; // dupe
+          if (track.duration_ms < 65000) continue;                    // too short
+          if (poolUris.has(track.uri)) continue;                      // already familiar
+          if (recentUris.has(track.uri)) continue;                    // recently played
+          if (heardUris.has(track.uri)) continue;                     // previously heard
+          if (candidates.some((c) => c.uri === track.uri)) continue;  // dupe
 
           candidates.push({
             uri: track.uri,
@@ -491,6 +454,7 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
             durationMs: track.duration_ms,
             albumName: album.name,
             type: "track",
+            source: "discovery",
           });
         }
       }
@@ -507,7 +471,7 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
 
   console.log(`    ⛏️  Mining done: ${candidates.length} candidates from ${minedAlbums.size} albums`);
 
-  // Library check via GET /me/library/contains
+  // ── Library check via GET /me/library/contains ──
   const filtered = [];
   const accessToken = spotifyApi.getAccessToken();
 
@@ -528,7 +492,6 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
           if (!data[j]) filtered.push(batch[j]);
         }
       } else {
-        // Fallback: if endpoint expects different params, try with IDs
         const ids = batch.map((t) => t.uri.replace("spotify:track:", ""));
         const idRes = await fetch(
           `https://api.spotify.com/v1/me/library/contains?ids=${ids.join(",")}`,
@@ -550,7 +513,19 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
     }
   }
 
-  const selected = shuffle(filtered).slice(0, count);
+  // ── Max 1 song per artist ──
+  const shuffled = shuffle(filtered);
+  const selected = [];
+  const usedArtistIds = new Set();
+
+  for (const track of shuffled) {
+    if (selected.length >= count) break;
+    const primaryArtist = track.artist.split(",")[0].trim();
+    if (usedArtistIds.has(primaryArtist)) continue;
+    usedArtistIds.add(primaryArtist);
+    selected.push(track);
+  }
+
   console.log(`🔍 Discovery: ${candidates.length} candidates → ${filtered.length} not in library → ${selected.length} selected`);
   for (const track of selected) {
     console.log(`    🆕 ${track.name} — ${track.artist} (${Math.round(track.durationMs / 1000)}s)`);
@@ -659,10 +634,55 @@ async function main() {
     process.exit(1);
   }
 
+  // ── Resolve pending discovery from last run ──
+  const state = loadState();
+
+  if (!DRY_RUN && state.pending_discovery?.length > 0) {
+    console.log(`🔇 Checking ${state.pending_discovery.length} pending discovery tracks...`);
+
+    const recentlyPlayed = new Set();
+    try {
+      const params = { limit: 50 };
+      if (state.last_updated) {
+        params.after = new Date(state.last_updated).getTime();
+      }
+      const recent = await spotifyApi.getMyRecentlyPlayedTracks(params);
+      for (const item of recent.body.items) {
+        recentlyPlayed.add(item.track.uri);
+      }
+    } catch (err) {
+      console.error(`    ⚠️  Could not fetch recently played: ${err.message}`);
+    }
+
+    const heardTracks = loadHeardTracks();
+    const existingHeard = new Set(heardTracks.map((h) => h.uri));
+    let confirmed = 0;
+    let notPlayed = 0;
+
+    for (const pending of state.pending_discovery) {
+      if (recentlyPlayed.has(pending.uri)) {
+        if (!existingHeard.has(pending.uri)) {
+          heardTracks.push({
+            uri: pending.uri,
+            name: pending.name,
+            artist: pending.artist,
+            heard_at: new Date().toISOString(),
+          });
+          confirmed++;
+        }
+      } else {
+        notPlayed++;
+      }
+    }
+
+    saveHeardTracks(heardTracks);
+    console.log(`    ✅ ${confirmed} confirmed played → heard`);
+    console.log(`    🔄 ${notPlayed} not played → remain eligible`);
+  }
+
   // ── Podcasts ──
   const episodes = await fetchPodcastEpisodes(spotifyApi, config.podcasts || []);
 
-  const state = loadState();
   const currentEpisodeUris = episodes.map((e) => e.uri).sort().join(",");
   const previousEpisodeUris = state.episode_uris || "";
 
@@ -710,13 +730,21 @@ async function main() {
       episode_uris: currentEpisodeUris,
       last_updated: new Date().toISOString(),
     };
+
     if (PODCAST_ONLY) {
       newState.music_tracks = state.music_tracks || tracks;
       newState.last_full_refresh = state.last_full_refresh || null;
+      newState.pending_discovery = state.pending_discovery || [];
     } else {
       newState.music_tracks = tracks;
       newState.last_full_refresh = new Date().toISOString();
+      // Save discovery tracks as pending — only confirmed-played become "heard"
+      newState.pending_discovery = mixed
+        .filter((i) => i.source === "discovery")
+        .map((i) => ({ uri: i.uri, name: i.name, artist: i.artist }));
+      console.log(`🔇 ${newState.pending_discovery.length} discovery tracks saved as pending`);
     }
+
     saveState(newState);
     console.log("💾 State saved");
   }
@@ -731,40 +759,42 @@ async function fetchAllMusicTracks(spotifyApi, config) {
   const familiarCount = Math.ceil(totalSongs / 2);
   const discoveryCount = totalSongs - familiarCount;
 
-  // Step 1: Familiar track pool
   const pool = await fetchMusicPool(spotifyApi, musicConfig);
 
-  // Step 2: Grow artist pool
   const artistPool = loadArtistPool();
   const poolSizeBefore = artistPool.artists.length;
 
-  // Seed from saved tracks
   await seedPoolFromSavedTracks(spotifyApi, artistPool);
 
-  // Also seed from familiar pool artists (playlists + top tracks)
   for (const track of pool) {
     for (let k = 0; k < (track.artistIds?.length || 0); k++) {
       addToPool(artistPool, track.artistIds[k], track.artistNames?.[k] || "Unknown");
     }
   }
 
-  // Expand via appears_on + features (mine 10 random artists per run)
   if (artistPool.artists.length > 0) {
     await expandPool(spotifyApi, artistPool, 10);
   }
 
   console.log(`🎨 Artist pool: ${poolSizeBefore} → ${artistPool.artists.length}`);
 
-  // Save pool (even in dry-run — pool growth is not playlist-destructive)
   saveArtistPool(artistPool);
   console.log("💾 Artist pool saved");
 
-  // Step 3: Select familiar tracks
+  // Familiar: max 1 song per artist
   let familiar = musicConfig.shuffle !== false ? shuffle(pool) : [...pool];
-  familiar = familiar.slice(0, familiarCount);
+  const familiarFiltered = [];
+  const familiarArtists = new Set();
+  for (const track of familiar) {
+    if (familiarFiltered.length >= familiarCount) break;
+    const primaryArtist = track.artistIds?.[0] || track.artist;
+    if (familiarArtists.has(primaryArtist)) continue;
+    familiarArtists.add(primaryArtist);
+    familiarFiltered.push(track);
+  }
+  familiar = familiarFiltered;
   console.log(`🎵 Selected ${familiar.length} familiar tracks`);
 
-  // Step 4: Discovery from artist pool
   let discovery = [];
   if (discoveryCount > 0 && artistPool.artists.length > 0) {
     discovery = await fetchSmartDiscovery(spotifyApi, pool, artistPool, discoveryCount);
