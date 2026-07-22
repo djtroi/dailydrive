@@ -781,29 +781,52 @@ async function fetchAllMusicTracks(spotifyApi, config) {
   saveArtistPool(artistPool);
   console.log("💾 Artist pool saved");
 
+  // Step 3+4: Fill total_songs — flexible split, 1 per artist, backfill
+  const targetTotal = musicConfig.total_songs || 15;
+  const familiarTarget = Math.ceil(targetTotal / 2);
+
   // Familiar: max 1 song per artist
   let familiar = musicConfig.shuffle !== false ? shuffle(pool) : [...pool];
   const familiarFiltered = [];
   const familiarArtists = new Set();
   for (const track of familiar) {
-    if (familiarFiltered.length >= familiarCount) break;
+    if (familiarFiltered.length >= familiarTarget) break;
     const primaryArtist = track.artistIds?.[0] || track.artist;
     if (familiarArtists.has(primaryArtist)) continue;
     familiarArtists.add(primaryArtist);
     familiarFiltered.push(track);
   }
   familiar = familiarFiltered;
-  console.log(`🎵 Selected ${familiar.length} familiar tracks`);
+  console.log(`🎵 Selected ${familiar.length} familiar tracks (target: ${familiarTarget})`);
 
+  // Discovery gets remaining slots (if familiar fell short, discovery gets more)
+  const discoveryTarget = targetTotal - familiar.length;
   let discovery = [];
-  if (discoveryCount > 0 && artistPool.artists.length > 0) {
-    discovery = await fetchSmartDiscovery(spotifyApi, pool, artistPool, discoveryCount);
-  } else if (discoveryCount > 0) {
-    console.log("    ⚠️  Artist pool empty — familiar tracks only");
+  if (discoveryTarget > 0 && artistPool.artists.length > 0) {
+    discovery = await fetchSmartDiscovery(spotifyApi, pool, artistPool, discoveryTarget);
+  }
+
+  // Backfill: if discovery fell short, allow 2nd song per artist from familiar
+  const currentTotal = familiar.length + discovery.length;
+  if (currentTotal < targetTotal) {
+    const backfillNeeded = targetTotal - currentTotal;
+    const usedUris = new Set([...familiar, ...discovery].map((t) => t.uri));
+    let backfilled = 0;
+    const reshuffled = musicConfig.shuffle !== false ? shuffle(pool) : [...pool];
+    for (const track of reshuffled) {
+      if (backfilled >= backfillNeeded) break;
+      if (usedUris.has(track.uri)) continue;
+      usedUris.add(track.uri);
+      familiar.push(track);
+      backfilled++;
+    }
+    if (backfilled > 0) {
+      console.log(`🎵 Backfilled ${backfilled} extra familiar tracks to reach target`);
+    }
   }
 
   const tracks = [...familiar, ...discovery];
-  console.log(`🎵 Music total: ${familiar.length} familiar + ${discovery.length} discovery = ${tracks.length}`);
+  console.log(`🎵 Music total: ${familiar.length} familiar + ${discovery.length} discovery = ${tracks.length} (target: ${targetTotal})`);
   return tracks;
 }
 
