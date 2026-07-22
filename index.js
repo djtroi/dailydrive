@@ -127,9 +127,8 @@ function addToPool(pool, artistId, artistName) {
     added: new Date().toISOString(),
   });
 
-  while (pool.artists.length > ARTIST_POOL_MAX) {
-    const removed = pool.artists.shift();
-    console.log(`    🗑️  Pool full — evicted oldest: ${removed.name}`);
+while (pool.artists.length > ARTIST_POOL_MAX) {
+    pool.artists.shift();  // stilles Evict, kein console.log
   }
 
   return true;
@@ -348,7 +347,7 @@ async function expandPool(spotifyApi, pool, artistsToMine) {
   for (const entry of candidates) {
     try {
       const albumData = await spotifyApi.getArtistAlbums(entry.id, {
-        limit: 20,
+        limit: 10,
         include_groups: "appears_on,album,single",
       });
 
@@ -480,9 +479,10 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
     const uris = batch.map((t) => t.uri);
 
     try {
-      const queryString = uris.map((u) => encodeURIComponent(u)).join(",");
+      // New Feb 2026 endpoint: individual query params, not comma-separated
+      const queryString = uris.map((u) => `uris=${encodeURIComponent(u)}`).join("&");
       const res = await fetch(
-        `https://api.spotify.com/v1/me/library/contains?uris=${queryString}`,
+        `https://api.spotify.com/v1/me/library/contains?${queryString}`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
 
@@ -492,20 +492,9 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
           if (!data[j]) filtered.push(batch[j]);
         }
       } else {
-        const ids = batch.map((t) => t.uri.replace("spotify:track:", ""));
-        const idRes = await fetch(
-          `https://api.spotify.com/v1/me/library/contains?ids=${ids.join(",")}`,
-          { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-        if (idRes.ok) {
-          const data = await idRes.json();
-          for (let j = 0; j < batch.length; j++) {
-            if (!data[j]) filtered.push(batch[j]);
-          }
-        } else {
-          console.error(`    ⚠️  Library check failed (${res.status} / ${idRes.status}) — including all`);
-          filtered.push(...batch);
-        }
+        // Fallback: skip library check, rely on other filters
+        console.error(`    ⚠️  Library check returned ${res.status} — skipping filter`);
+        filtered.push(...batch);
       }
     } catch (err) {
       console.error(`    ⚠️  Library check error: ${err.message}`);
