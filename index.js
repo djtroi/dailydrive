@@ -17,6 +17,7 @@ const HEARD_TRACKS_MAX = 3000;
 
 const DRY_RUN = process.argv.includes("--dry-run");
 const PODCAST_ONLY = process.argv.includes("--podcast-only");
+const API_DELAY = 150;  // ms between API calls (was 50)
 
 // =============================================================================
 // Helper Functions
@@ -216,7 +217,9 @@ async function fetchPodcastEpisodes(spotifyApi, podcasts) {
         }
       }
     } catch (err) {
-      console.error(`    ⚠️  Failed to fetch ${podcast.name}: ${err.message}`);
+      const status = err.statusCode || err.status || "";
+      const msg = err.body?.error?.message || err.message || JSON.stringify(err);
+      console.error(`    ⚠️  Failed to fetch ${podcast.name}: ${status} ${msg}`);
     }
   }
 
@@ -258,9 +261,15 @@ async function fetchMusicPool(spotifyApi, musicConfig) {
         }
         console.log(`    ${allTracks.length} tracks so far`);
       } catch (err) {
-        console.error(`    ⚠️  Failed: ${err.message}`);
+        const msg = err.message || JSON.stringify(err);
+        if (msg.includes("403")) {
+          console.error(`    ⚠️  "${playlist.name}" is not owned by you — Spotify blocks access.`);
+          console.error(`       👉 Open Spotify → find "${playlist.name}" → ⋯ → Copy to Your Library`);
+          console.error(`       👉 Then update config.yaml with the new playlist ID`);
+        } else {
+          console.error(`    ⚠️  Failed to fetch ${playlist.name}: ${msg}`);
+        }
       }
-    }
   }
 
   if (musicConfig.top_tracks?.enabled) {
@@ -379,7 +388,7 @@ async function expandPool(spotifyApi, pool, artistsToMine) {
         } catch (err) { /* non-critical */ }
       }
 
-      await delay(50);
+      await delay(API_DELAY);
     } catch (err) {
       console.error(`    ⚠️  Mining failed for ${entry.name}: ${err.message}`);
     }
@@ -462,7 +471,7 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
         console.log(`    ⛏️  ${i + 1}/${maxToMine} artists → ${candidates.length} candidates`);
       }
 
-      await delay(50);
+      await delay(API_DELAY);
     } catch (err) {
       console.error(`    ⚠️  Mining failed for ${artist.name}: ${err.message}`);
     }
