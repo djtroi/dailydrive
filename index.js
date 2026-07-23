@@ -17,7 +17,7 @@ const HEARD_TRACKS_MAX = 3000;
 
 const DRY_RUN = process.argv.includes("--dry-run");
 const PODCAST_ONLY = process.argv.includes("--podcast-only");
-const API_DELAY = 150;  // ms between API calls (was 50)
+const API_DELAY = 150;
 
 // =============================================================================
 // Helper Functions
@@ -128,8 +128,8 @@ function addToPool(pool, artistId, artistName) {
     added: new Date().toISOString(),
   });
 
-while (pool.artists.length > ARTIST_POOL_MAX) {
-    pool.artists.shift();  // stilles Evict, kein console.log
+  while (pool.artists.length > ARTIST_POOL_MAX) {
+    pool.artists.shift();
   }
 
   return true;
@@ -270,6 +270,7 @@ async function fetchMusicPool(spotifyApi, musicConfig) {
           console.error(`    ⚠️  Failed to fetch ${playlist.name}: ${msg}`);
         }
       }
+    }
   }
 
   if (musicConfig.top_tracks?.enabled) {
@@ -449,11 +450,11 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
         const trackData = await spotifyApi.getAlbumTracks(album.id, { limit: 50 });
 
         for (const track of trackData.body.items) {
-          if (track.duration_ms < 65000) continue;                    // too short
-          if (poolUris.has(track.uri)) continue;                      // already familiar
-          if (recentUris.has(track.uri)) continue;                    // recently played
-          if (heardUris.has(track.uri)) continue;                     // previously heard
-          if (candidates.some((c) => c.uri === track.uri)) continue;  // dupe
+          if (track.duration_ms < 65000) continue;
+          if (poolUris.has(track.uri)) continue;
+          if (recentUris.has(track.uri)) continue;
+          if (heardUris.has(track.uri)) continue;
+          if (candidates.some((c) => c.uri === track.uri)) continue;
 
           candidates.push({
             uri: track.uri,
@@ -488,7 +489,6 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
     const uris = batch.map((t) => t.uri);
 
     try {
-      // New Feb 2026 endpoint: individual query params, not comma-separated
       const queryString = uris.map((u) => `uris=${encodeURIComponent(u)}`).join("&");
       const res = await fetch(
         `https://api.spotify.com/v1/me/library/contains?${queryString}`,
@@ -501,7 +501,6 @@ async function fetchSmartDiscovery(spotifyApi, poolTracks, artistPool, count) {
           if (!data[j]) filtered.push(batch[j]);
         }
       } else {
-        // Fallback: skip library check, rely on other filters
         console.error(`    ⚠️  Library check returned ${res.status} — skipping filter`);
         filtered.push(...batch);
       }
@@ -736,7 +735,6 @@ async function main() {
     } else {
       newState.music_tracks = tracks;
       newState.last_full_refresh = new Date().toISOString();
-      // Save discovery tracks as pending — only confirmed-played become "heard"
       newState.pending_discovery = mixed
         .filter((i) => i.source === "discovery")
         .map((i) => ({ uri: i.uri, name: i.name, artist: i.artist }));
@@ -754,8 +752,6 @@ async function main() {
 async function fetchAllMusicTracks(spotifyApi, config) {
   const musicConfig = config.music || {};
   const totalSongs = musicConfig.total_songs || 15;
-  const familiarCount = Math.ceil(totalSongs / 2);
-  const discoveryCount = totalSongs - familiarCount;
 
   const pool = await fetchMusicPool(spotifyApi, musicConfig);
 
@@ -783,7 +779,6 @@ async function fetchAllMusicTracks(spotifyApi, config) {
   const targetTotal = musicConfig.total_songs || 15;
   const familiarTarget = Math.ceil(targetTotal / 2);
 
-  // Familiar: max 1 song per artist
   let familiar = musicConfig.shuffle !== false ? shuffle(pool) : [...pool];
   const familiarFiltered = [];
   const familiarArtists = new Set();
@@ -797,14 +792,12 @@ async function fetchAllMusicTracks(spotifyApi, config) {
   familiar = familiarFiltered;
   console.log(`🎵 Selected ${familiar.length} familiar tracks (target: ${familiarTarget})`);
 
-  // Discovery gets remaining slots (if familiar fell short, discovery gets more)
   const discoveryTarget = targetTotal - familiar.length;
   let discovery = [];
   if (discoveryTarget > 0 && artistPool.artists.length > 0) {
     discovery = await fetchSmartDiscovery(spotifyApi, pool, artistPool, discoveryTarget);
   }
 
-  // Backfill: if discovery fell short, allow 2nd song per artist from familiar
   const currentTotal = familiar.length + discovery.length;
   if (currentTotal < targetTotal) {
     const backfillNeeded = targetTotal - currentTotal;
